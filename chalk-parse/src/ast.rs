@@ -177,8 +177,8 @@ pub enum Ty {
         name: Identifier,
         args: Vec<Parameter>,
     },
-    Alias {
-        alias: AliasTy,
+    Projection {
+        proj: ProjectionTy,
     },
     ForAll {
         lifetime_names: Vec<Identifier>,
@@ -233,7 +233,13 @@ pub enum Lifetime {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct AliasTy {
+pub enum AliasTy {
+    Projection(ProjectionTy),
+    // TODO ImplTrait
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ProjectionTy {
     pub trait_ref: TraitRef,
     pub name: Identifier,
     pub args: Vec<Parameter>,
@@ -279,7 +285,7 @@ impl fmt::Display for Identifier {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum WhereClause {
     Implemented { trait_ref: TraitRef },
-    AliasEq { alias: AliasTy, ty: Ty },
+    ProjectionEq { projection: ProjectionTy, ty: Ty },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
