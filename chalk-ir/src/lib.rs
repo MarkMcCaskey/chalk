@@ -887,7 +887,7 @@ impl<I: Interner> ParameterData<I> {
 #[derive(Clone, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
 pub enum AliasTy<I: Interner> {
     Projection(ProjectionTy<I>),
-    ImplTrait(ImplTraitId<I>),
+    ImplTrait(ImplTraitTy<I>),
 }
 
 impl<I: Interner> AliasTy<I> {
@@ -917,6 +917,7 @@ pub struct ProjectionTy<I: Interner> {
 #[derive(Clone, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
 pub struct ImplTraitTy<I: Interner> {
     pub impl_trait_id: ImplTraitId<I>,
+    pub substitution: Substitution<I>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
