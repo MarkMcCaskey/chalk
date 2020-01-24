@@ -537,9 +537,9 @@ impl<I: Interner> Debug for Normalize<I> {
     }
 }
 
-impl<I: Interner> Debug for ProjectionEq<I> {
+impl<I: Interner> Debug for AliasEq<I> {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
-        write!(fmt, "ProjectionEq({:?} = {:?})", self.projection, self.ty)
+        write!(fmt, "AliasEq({:?} = {:?})", self.alias, self.ty)
     }
 }
 
@@ -547,7 +547,7 @@ impl<I: Interner> Debug for WhereClause<I> {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
         match self {
             WhereClause::Implemented(tr) => write!(fmt, "Implemented({:?})", tr.with_colon()),
-            WhereClause::ProjectionEq(p) => write!(fmt, "{:?}", p),
+            WhereClause::AliasEq(a) => write!(fmt, "{:?}", a),
         }
     }
 }
