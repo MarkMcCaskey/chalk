@@ -1147,6 +1147,15 @@ impl<I: Interner> DomainGoal<I> {
             goal => goal,
         }
     }
+
+    pub fn inputs(&self, interner: &I) -> Vec<Parameter<I>> {
+        match self {
+            DomainGoal::Holds(WhereClause::AliasEq(alias_eq)) => {
+                vec![ParameterKind::Ty(alias_eq.alias.clone().intern(interner)).intern()]
+            }
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Fold, Visit)]
