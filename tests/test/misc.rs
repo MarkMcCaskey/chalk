@@ -61,7 +61,6 @@ fn basic() {
 
 /// Make sure we don't get a stack overflow or other badness for this
 /// test from scalexm.
-#[ignore]
 #[test]
 fn subgoal_abstraction() {
     test! {
@@ -161,7 +160,6 @@ fn only_draw_so_many_blow_up() {
     }
 }
 
-#[ignore]
 #[test]
 fn subgoal_cycle_uninhabited() {
     test! {
@@ -219,7 +217,6 @@ fn subgoal_cycle_uninhabited() {
     }
 }
 
-#[ignore]
 #[test]
 fn subgoal_cycle_inhabited() {
     test! {
