@@ -5,7 +5,7 @@ use chalk_ir::{
 };
 use chalk_parse::ast::*;
 use chalk_rust_ir as rust_ir;
-use chalk_rust_ir::{Anonymize, AssociatedTyValueId, IntoWhereClauses, ToParameter};
+use chalk_rust_ir::{Anonymize, AssociatedTyValueId, IntoWhereClauses, LangItem, ToParameter};
 use lalrpop_intern::intern;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -248,6 +248,7 @@ impl LowerProgram for Program {
 
         let mut struct_data = BTreeMap::new();
         let mut trait_data = BTreeMap::new();
+        let mut trait_lang_items = BTreeMap::new();
         let mut impl_data = BTreeMap::new();
         let mut associated_ty_data = BTreeMap::new();
         let mut associated_ty_values = BTreeMap::new();
@@ -269,10 +270,24 @@ impl LowerProgram for Program {
                 }
                 Item::TraitDefn(ref trait_defn) => {
                     let trait_id = TraitId(raw_id);
-                    trait_data.insert(
-                        trait_id,
-                        Arc::new(trait_defn.lower_trait(trait_id, &empty_env)?),
-                    );
+                    let trait_datum = trait_defn.lower_trait(trait_id, &empty_env)?;
+
+                    if let Some(well_known) = trait_datum.well_known {
+                        if let Some(lang_item) = match well_known {
+                            rust_ir::WellKnownTrait::SizedTrait => Some(LangItem::SizedTrait),
+                            _ => None,
+                        } {
+                            use std::collections::btree_map::Entry;
+                            match trait_lang_items.entry(lang_item) {
+                                Entry::Vacant(vacant) => vacant.insert(trait_id),
+                                Entry::Occupied(_) => {
+                                    return Err(RustIrError::DuplicateLangItem(lang_item))
+                                }
+                            };
+                        }
+                    }
+
+                    trait_data.insert(trait_id, Arc::new(trait_datum));
 
                     for assoc_ty_defn in &trait_defn.assoc_ty_defns {
                         let lookup = &associated_ty_lookups[&(trait_id, assoc_ty_defn.name.str)];
@@ -369,6 +384,7 @@ impl LowerProgram for Program {
             trait_kinds,
             struct_data,
             trait_data,
+            trait_lang_items,
             impl_data,
             associated_ty_values,
             associated_ty_data,
