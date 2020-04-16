@@ -179,7 +179,7 @@ pub enum Ty {
         ty: Box<Ty>,
     },
     Tuple {
-        arity: usize,
+        types: Vec<Box<Ty>>,
     },
     Scalar {
         ty: ScalarType,
