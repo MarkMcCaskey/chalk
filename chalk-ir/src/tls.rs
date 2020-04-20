@@ -1,7 +1,8 @@
 use crate::interner::ChalkIr;
 use crate::{
-    debug::SeparatorTraitRef, AliasTy, ApplicationTy, AssocTypeId, Goal, Goals, Lifetime,
-    Parameter, ProgramClauseImplication, StructId, Substitution, TraitId, Ty,
+    debug::SeparatorTraitRef, AliasTy, ApplicationTy, AssocTypeId, Goal, Goals, Lifetime, OpaqueTy,
+    OpaqueTyId, Parameter, ProgramClause, ProgramClauseImplication, ProgramClauses, ProjectionTy,
+    QuantifiedWhereClauses, StructId, Substitution, TraitId, Ty,
 };
 use std::cell::RefCell;
 use std::fmt;
@@ -30,9 +31,27 @@ pub trait DebugContext {
         fmt: &mut fmt::Formatter<'_>,
     ) -> Result<(), fmt::Error>;
 
+    fn debug_opaque_ty_id(
+        &self,
+        id: OpaqueTyId<ChalkIr>,
+        fmt: &mut fmt::Formatter<'_>,
+    ) -> Result<(), fmt::Error>;
+
     fn debug_alias(
         &self,
         alias: &AliasTy<ChalkIr>,
+        fmt: &mut fmt::Formatter<'_>,
+    ) -> Result<(), fmt::Error>;
+
+    fn debug_opaque_ty(
+        &self,
+        opaque_ty: &OpaqueTy<ChalkIr>,
+        fmt: &mut fmt::Formatter<'_>,
+    ) -> Result<(), fmt::Error>;
+
+    fn debug_projection_ty(
+        &self,
+        proj: &ProjectionTy<ChalkIr>,
         fmt: &mut fmt::Formatter<'_>,
     ) -> Result<(), fmt::Error>;
 
@@ -68,6 +87,18 @@ pub trait DebugContext {
         fmt: &mut fmt::Formatter<'_>,
     ) -> Result<(), fmt::Error>;
 
+    fn debug_program_clause(
+        &self,
+        clause: &ProgramClause<ChalkIr>,
+        fmt: &mut fmt::Formatter<'_>,
+    ) -> Result<(), fmt::Error>;
+
+    fn debug_program_clauses(
+        &self,
+        clauses: &ProgramClauses<ChalkIr>,
+        fmt: &mut fmt::Formatter<'_>,
+    ) -> Result<(), fmt::Error>;
+
     fn debug_application_ty(
         &self,
         application_ty: &ApplicationTy<ChalkIr>,
@@ -83,6 +114,12 @@ pub trait DebugContext {
     fn debug_separator_trait_ref(
         &self,
         separator_trait_ref: &SeparatorTraitRef<'_, ChalkIr>,
+        fmt: &mut fmt::Formatter<'_>,
+    ) -> Result<(), fmt::Error>;
+
+    fn debug_quantified_where_clauses(
+        &self,
+        clauses: &QuantifiedWhereClauses<ChalkIr>,
         fmt: &mut fmt::Formatter<'_>,
     ) -> Result<(), fmt::Error>;
 }

@@ -1,9 +1,15 @@
 use chalk_ir::cast::{Cast, Caster};
 use chalk_ir::interner::ChalkIr;
-use chalk_ir::{self, AssocTypeId, BoundVar, DebruijnIndex, ImplId, StructId, TraitId};
+use chalk_ir::{
+    self, AssocTypeId, BoundVar, ClausePriority, DebruijnIndex, ImplId, OpaqueTyId,
+    QuantifiedWhereClauses, StructId, Substitution, TraitId,
+};
 use chalk_parse::ast::*;
 use chalk_rust_ir as rust_ir;
-use chalk_rust_ir::{Anonymize, AssociatedTyValueId, IntoWhereClauses, ToParameter};
+use chalk_rust_ir::{
+    Anonymize, AssociatedTyValueId, IntoWhereClauses, OpaqueTyDatum, OpaqueTyDatumBound,
+    ToParameter,
+};
 use lalrpop_intern::intern;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,6 +20,7 @@ use crate::{Identifier as Ident, RawId, TypeKind, TypeSort};
 
 type StructIds = BTreeMap<Ident, chalk_ir::StructId<ChalkIr>>;
 type TraitIds = BTreeMap<Ident, chalk_ir::TraitId<ChalkIr>>;
+type OpaqueTyIds = BTreeMap<Ident, chalk_ir::OpaqueTyId<ChalkIr>>;
 type StructKinds = BTreeMap<chalk_ir::StructId<ChalkIr>, TypeKind>;
 type TraitKinds = BTreeMap<chalk_ir::TraitId<ChalkIr>, TypeKind>;
 type AssociatedTyLookups = BTreeMap<(chalk_ir::TraitId<ChalkIr>, Ident), AssociatedTyLookup>;
@@ -29,6 +36,7 @@ struct Env<'k> {
     struct_kinds: &'k StructKinds,
     trait_ids: &'k TraitIds,
     trait_kinds: &'k TraitKinds,
+    opaque_ty_ids: &'k OpaqueTyIds,
     associated_ty_lookups: &'k AssociatedTyLookups,
     /// Parameter identifiers are used as keys, therefore
     /// all identifiers in an environment must be unique (no shadowing).
@@ -63,6 +71,7 @@ struct AssociatedTyLookup {
 enum TypeLookup {
     Struct(chalk_ir::StructId<ChalkIr>),
     Parameter(BoundVar),
+    Opaque(chalk_ir::OpaqueTyId<ChalkIr>),
 }
 
 enum LifetimeLookup {
@@ -85,6 +94,9 @@ impl<'k> Env<'k> {
             return Ok(TypeLookup::Struct(*id));
         }
 
+        if let Some(id) = self.opaque_ty_ids.get(&name.str) {
+            return Ok(TypeLookup::Opaque(*id));
+        }
         if let Some(_) = self.trait_ids.get(&name.str) {
             return Err(RustIrError::NotStruct(name));
         }
@@ -166,10 +178,7 @@ impl<'k> Env<'k> {
     {
         let binders: Vec<_> = binders.into_iter().collect();
         let env = self.introduce(binders.iter().cloned())?;
-        Ok(chalk_ir::Binders {
-            binders: binders.anonymize(),
-            value: op(&env)?,
-        })
+        Ok(chalk_ir::Binders::new(binders.anonymize(), op(&env)?))
     }
 }
 
@@ -223,8 +232,10 @@ impl LowerProgram for Program {
 
         let mut struct_ids = BTreeMap::new();
         let mut trait_ids = BTreeMap::new();
+        let mut opaque_ty_ids = BTreeMap::new();
         let mut struct_kinds = BTreeMap::new();
         let mut trait_kinds = BTreeMap::new();
+        let mut opaque_ty_kinds = BTreeMap::new();
         for (item, &raw_id) in self.items.iter().zip(&raw_ids) {
             match item {
                 Item::StructDefn(defn) => {
@@ -239,6 +250,12 @@ impl LowerProgram for Program {
                     trait_ids.insert(type_kind.name, id);
                     trait_kinds.insert(id, type_kind);
                 }
+                Item::OpaqueTyDefn(defn) => {
+                    let type_kind = defn.lower_type_kind()?;
+                    let id = OpaqueTyId(raw_id);
+                    opaque_ty_ids.insert(defn.identifier.str, id);
+                    opaque_ty_kinds.insert(id, type_kind);
+                }
                 Item::Impl(_) => continue,
                 Item::Clause(_) => continue,
             };
@@ -246,9 +263,11 @@ impl LowerProgram for Program {
 
         let mut struct_data = BTreeMap::new();
         let mut trait_data = BTreeMap::new();
+        let mut well_known_traits = BTreeMap::new();
         let mut impl_data = BTreeMap::new();
         let mut associated_ty_data = BTreeMap::new();
         let mut associated_ty_values = BTreeMap::new();
+        let mut opaque_ty_data = BTreeMap::new();
         let mut custom_clauses = Vec::new();
         for (item, &raw_id) in self.items.iter().zip(&raw_ids) {
             let empty_env = Env {
@@ -256,6 +275,7 @@ impl LowerProgram for Program {
                 struct_kinds: &struct_kinds,
                 trait_ids: &trait_ids,
                 trait_kinds: &trait_kinds,
+                opaque_ty_ids: &opaque_ty_ids,
                 associated_ty_lookups: &associated_ty_lookups,
                 parameter_map: BTreeMap::new(),
             };
@@ -267,10 +287,13 @@ impl LowerProgram for Program {
                 }
                 Item::TraitDefn(ref trait_defn) => {
                     let trait_id = TraitId(raw_id);
-                    trait_data.insert(
-                        trait_id,
-                        Arc::new(trait_defn.lower_trait(trait_id, &empty_env)?),
-                    );
+                    let trait_datum = trait_defn.lower_trait(trait_id, &empty_env)?;
+
+                    if let Some(well_known) = trait_datum.well_known {
+                        well_known_traits.insert(well_known, trait_id);
+                    }
+
+                    trait_data.insert(trait_id, Arc::new(trait_datum));
 
                     for assoc_ty_defn in &trait_defn.assoc_ty_defns {
                         let lookup = &associated_ty_lookups[&(trait_id, assoc_ty_defn.name.str)];
@@ -357,6 +380,57 @@ impl LowerProgram for Program {
                 Item::Clause(ref clause) => {
                     custom_clauses.extend(clause.lower_clause(&empty_env)?);
                 }
+                Item::OpaqueTyDefn(ref opaque_ty) => {
+                    if let Some(&opaque_ty_id) = opaque_ty_ids.get(&opaque_ty.identifier.str) {
+                        let parameter_kinds = opaque_ty
+                            .parameter_kinds
+                            .iter()
+                            .map(|k| k.lower())
+                            .collect::<Vec<_>>();
+
+                        // Introduce the parameters declared on the opaque type definition.
+                        // So if we have `type Foo<P1..Pn> = impl Trait<T1..Tn>`, this would introduce `P1..Pn`
+                        let binders = empty_env.in_binders(parameter_kinds, |env| {
+                            let hidden_ty = opaque_ty.ty.lower(&env)?;
+
+                            // Introduce a variable to represent the hidden "self type". This will be used in the bounds.
+                            // So the `impl Trait<T1..Tn>` will be lowered to `exists<Self> { Self: Trait<T1..Tn> }`.
+                            let bounds: chalk_ir::Binders<Vec<chalk_ir::Binders<_>>> = env
+                                .in_binders(
+                                    Some(chalk_ir::ParameterKind::Ty(intern(FIXME_SELF))),
+                                    |env1| {
+                                        let interner = env1.interner();
+                                        Ok(opaque_ty
+                                            .bounds
+                                            .lower(&env1)?
+                                            .iter()
+                                            .flat_map(|qil| {
+                                                // Instantiate the bounds with the innermost bound variable, which represents Self, as the self type.
+                                                qil.into_where_clauses(
+                                                    interner,
+                                                    chalk_ir::TyData::BoundVar(BoundVar::new(
+                                                        DebruijnIndex::INNERMOST,
+                                                        0,
+                                                    ))
+                                                    .intern(interner),
+                                                )
+                                            })
+                                            .collect())
+                                    },
+                                )?;
+
+                            Ok(OpaqueTyDatumBound { hidden_ty, bounds })
+                        })?;
+
+                        opaque_ty_data.insert(
+                            opaque_ty_id,
+                            Arc::new(OpaqueTyDatum {
+                                opaque_ty_id,
+                                bound: binders,
+                            }),
+                        );
+                    }
+                }
             }
         }
 
@@ -367,9 +441,12 @@ impl LowerProgram for Program {
             trait_kinds,
             struct_data,
             trait_data,
+            well_known_traits,
             impl_data,
             associated_ty_values,
             associated_ty_data,
+            opaque_ty_ids,
+            opaque_ty_data,
             custom_clauses,
         };
 
@@ -520,10 +597,7 @@ impl LowerTypeKind for StructDefn {
         Ok(TypeKind {
             sort: TypeSort::Struct,
             name: self.name.str,
-            binders: chalk_ir::Binders {
-                binders: self.all_parameters().anonymize(),
-                value: (),
-            },
+            binders: chalk_ir::Binders::new(self.all_parameters().anonymize(), ()),
         })
     }
 }
@@ -540,11 +614,22 @@ impl LowerTypeKind for TraitDefn {
         Ok(TypeKind {
             sort: TypeSort::Trait,
             name: self.name.str,
-            binders: chalk_ir::Binders {
+            binders: chalk_ir::Binders::new(
                 // for the purposes of the *type*, ignore `Self`:
-                binders: binders.anonymize(),
-                value: (),
-            },
+                binders.anonymize(),
+                (),
+            ),
+        })
+    }
+}
+
+impl LowerTypeKind for OpaqueTyDefn {
+    fn lower_type_kind(&self) -> LowerResult<TypeKind> {
+        let binders: Vec<_> = self.parameter_kinds.iter().map(|p| p.lower()).collect();
+        Ok(TypeKind {
+            sort: TypeSort::Opaque,
+            name: self.identifier.str,
+            binders: chalk_ir::Binders::new(binders.anonymize(), ()),
         })
     }
 }
@@ -580,7 +665,7 @@ trait LowerWhereClause<T> {
     /// Lower from an AST `where` clause to an internal IR.
     /// Some AST `where` clauses can lower to multiple ones, this is why we return a `Vec`.
     /// As for now, this is the only the case for `where T: Foo<Item = U>` which lowers to
-    /// `Implemented(T: Foo)` and `AliasEq(<T as Foo>::Item = U)`.
+    /// `Implemented(T: Foo)` and `ProjectionEq(<T as Foo>::Item = U)`.
     fn lower(&self, env: &Env) -> LowerResult<Vec<T>>;
 }
 
@@ -590,12 +675,12 @@ impl LowerWhereClause<chalk_ir::WhereClause<ChalkIr>> for WhereClause {
             WhereClause::Implemented { trait_ref } => {
                 vec![chalk_ir::WhereClause::Implemented(trait_ref.lower(env)?)]
             }
-            WhereClause::AliasEq { alias, ty } => vec![
+            WhereClause::ProjectionEq { projection, ty } => vec![
                 chalk_ir::WhereClause::AliasEq(chalk_ir::AliasEq {
-                    alias: alias.lower(env)?,
+                    alias: chalk_ir::AliasTy::Projection(projection.lower(env)?),
                     ty: ty.lower(env)?,
                 }),
-                chalk_ir::WhereClause::Implemented(alias.trait_ref.lower(env)?),
+                chalk_ir::WhereClause::Implemented(projection.trait_ref.lower(env)?),
             ],
         };
         Ok(where_clauses)
@@ -622,9 +707,9 @@ impl LowerDomainGoal for DomainGoal {
                 .into_iter()
                 .casted(interner)
                 .collect(),
-            DomainGoal::Normalize { alias, ty } => {
+            DomainGoal::Normalize { projection, ty } => {
                 vec![chalk_ir::DomainGoal::Normalize(chalk_ir::Normalize {
-                    alias: alias.lower(env)?,
+                    alias: chalk_ir::AliasTy::Projection(projection.lower(env)?),
                     ty: ty.lower(env)?,
                 })]
             }
@@ -654,6 +739,7 @@ impl LowerDomainGoal for DomainGoal {
             DomainGoal::DownstreamType { ty } => {
                 vec![chalk_ir::DomainGoal::DownstreamType(ty.lower(env)?)]
             }
+            DomainGoal::Reveal => vec![chalk_ir::DomainGoal::Reveal(())],
         };
         Ok(goals)
     }
@@ -913,13 +999,13 @@ impl LowerTraitFlags for TraitFlags {
     }
 }
 
-trait LowerAliasTy {
-    fn lower(&self, env: &Env) -> LowerResult<chalk_ir::AliasTy<ChalkIr>>;
+trait LowerProjectionTy {
+    fn lower(&self, env: &Env) -> LowerResult<chalk_ir::ProjectionTy<ChalkIr>>;
 }
 
-impl LowerAliasTy for AliasTy {
-    fn lower(&self, env: &Env) -> LowerResult<chalk_ir::AliasTy<ChalkIr>> {
-        let AliasTy {
+impl LowerProjectionTy for ProjectionTy {
+    fn lower(&self, env: &Env) -> LowerResult<chalk_ir::ProjectionTy<ChalkIr>> {
+        let ProjectionTy {
             ref trait_ref,
             ref name,
             ref args,
@@ -958,7 +1044,7 @@ impl LowerAliasTy for AliasTy {
 
         args.extend(trait_substitution.iter(interner).cloned());
 
-        Ok(chalk_ir::AliasTy {
+        Ok(chalk_ir::ProjectionTy {
             associated_ty_id: lookup.id,
             substitution: chalk_ir::Substitution::from(interner, args),
         })
@@ -991,6 +1077,13 @@ impl LowerTy for Ty {
                     }
                 }
                 TypeLookup::Parameter(d) => Ok(chalk_ir::TyData::BoundVar(d).intern(interner)),
+                TypeLookup::Opaque(id) => Ok(chalk_ir::TyData::Alias(chalk_ir::AliasTy::Opaque(
+                    chalk_ir::OpaqueTy {
+                        opaque_ty_id: id,
+                        substitution: chalk_ir::Substitution::empty(interner),
+                    },
+                ))
+                .intern(interner)),
             },
 
             Ty::Dyn { ref bounds } => Ok(chalk_ir::TyData::Dyn(chalk_ir::DynTy {
@@ -998,10 +1091,9 @@ impl LowerTy for Ty {
                     // FIXME: Figure out a proper name for this type parameter
                     Some(chalk_ir::ParameterKind::Ty(intern(FIXME_SELF))),
                     |env| {
-                        Ok(bounds
-                            .lower(env)?
-                            .iter()
-                            .flat_map(|qil| {
+                        Ok(QuantifiedWhereClauses::from(
+                            interner,
+                            bounds.lower(env)?.iter().flat_map(|qil| {
                                 qil.into_where_clauses(
                                     interner,
                                     chalk_ir::TyData::BoundVar(BoundVar::new(
@@ -1010,8 +1102,8 @@ impl LowerTy for Ty {
                                     ))
                                     .intern(interner),
                                 )
-                            })
-                            .collect())
+                            }),
+                        ))
                     },
                 )?,
             })
@@ -1020,7 +1112,9 @@ impl LowerTy for Ty {
             Ty::Apply { name, ref args } => {
                 let id = match env.lookup_type(name)? {
                     TypeLookup::Struct(id) => id,
-                    TypeLookup::Parameter(_) => Err(RustIrError::CannotApplyTypeParameter(name))?,
+                    TypeLookup::Parameter(_) | TypeLookup::Opaque(_) => {
+                        Err(RustIrError::CannotApplyTypeParameter(name))?
+                    }
                 };
 
                 let k = env.struct_kind(id);
@@ -1054,9 +1148,10 @@ impl LowerTy for Ty {
                 .intern(interner))
             }
 
-            Ty::Alias { ref alias } => {
-                Ok(chalk_ir::TyData::Alias(alias.lower(env)?).intern(interner))
-            }
+            Ty::Projection { ref proj } => Ok(chalk_ir::TyData::Alias(
+                chalk_ir::AliasTy::Projection(proj.lower(env)?),
+            )
+            .intern(interner)),
 
             Ty::ForAll {
                 ref lifetime_names,
@@ -1070,7 +1165,10 @@ impl LowerTy for Ty {
 
                 let function = chalk_ir::Fn {
                     num_binders: lifetime_names.len(),
-                    parameters: vec![ty.lower(&quantified_env)?.cast(interner)],
+                    substitution: Substitution::from(
+                        interner,
+                        Some(ty.lower(&quantified_env)?.cast(interner)),
+                    ),
                 };
                 Ok(chalk_ir::TyData::Function(function).intern(interner))
             }
@@ -1203,6 +1301,7 @@ impl LowerClause for Clause {
                 .map(|consequence| chalk_ir::ProgramClauseImplication {
                     consequence,
                     conditions: conditions.clone(),
+                    priority: ClausePriority::High,
                 })
                 .collect::<Vec<_>>();
             Ok(implications)
@@ -1212,7 +1311,7 @@ impl LowerClause for Clause {
             .into_iter()
             .map(
                 |implication: chalk_ir::Binders<chalk_ir::ProgramClauseImplication<ChalkIr>>| {
-                    chalk_ir::ProgramClause::ForAll(implication)
+                    chalk_ir::ProgramClauseData::ForAll(implication).intern(interner)
                 },
             )
             .collect();
@@ -1296,6 +1395,7 @@ impl LowerGoal<LoweredProgram> for Goal {
         let env = Env {
             struct_ids: &program.struct_ids,
             trait_ids: &program.trait_ids,
+            opaque_ty_ids: &program.opaque_ty_ids,
             struct_kinds: &program.struct_kinds,
             trait_kinds: &program.trait_kinds,
             associated_ty_lookups: &associated_ty_lookups,
@@ -1317,11 +1417,12 @@ impl<'k> LowerGoal<Env<'k>> for Goal {
                 // `T: Trait<Assoc = U>` to `FromEnv(T: Trait)` and `FromEnv(T: Trait<Assoc = U>)`
                 // in the assumptions of an `if` goal, e.g. `if (T: Trait) { ... }` lowers to
                 // `if (FromEnv(T: Trait)) { ... /* this part is untouched */ ... }`.
-                let where_clauses: LowerResult<Vec<_>> = hyp
+                let where_clauses = hyp
                     .into_iter()
                     .flat_map(|h| h.lower_clause(env).apply_result())
-                    .map(|result| result.map(|h| h.into_from_env_clause(interner)))
-                    .collect();
+                    .map(|result| result.map(|h| h.into_from_env_clause(interner)));
+                let where_clauses =
+                    chalk_ir::ProgramClauses::from_fallible(interner, where_clauses);
                 Ok(chalk_ir::GoalData::Implies(where_clauses?, g.lower(env)?).intern(interner))
             }
             Goal::And(g1, g2s) => {
@@ -1376,6 +1477,9 @@ impl LowerWellKnownTrait for WellKnownTrait {
     fn lower(&self) -> rust_ir::WellKnownTrait {
         match self {
             Self::SizedTrait => rust_ir::WellKnownTrait::SizedTrait,
+            Self::CopyTrait => rust_ir::WellKnownTrait::CopyTrait,
+            Self::CloneTrait => rust_ir::WellKnownTrait::CloneTrait,
+            Self::DropTrait => rust_ir::WellKnownTrait::DropTrait,
         }
     }
 }

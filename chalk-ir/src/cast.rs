@@ -81,6 +81,7 @@ reflexive_impl!(for(I: Interner) DomainGoal<I>);
 reflexive_impl!(for(I: Interner) Goal<I>);
 reflexive_impl!(for(I: Interner) WhereClause<I>);
 reflexive_impl!(for(I: Interner) ProgramClause<I>);
+reflexive_impl!(for(I: Interner) QuantifiedWhereClause<I>);
 
 impl<I: Interner> CastTo<WhereClause<I>> for TraitRef<I> {
     fn cast_to(self, _interner: &I) -> WhereClause<I> {
@@ -183,10 +184,12 @@ where
     I: Interner,
 {
     fn cast_to(self, interner: &I) -> ProgramClause<I> {
-        ProgramClause::Implies(ProgramClauseImplication {
+        ProgramClauseData::Implies(ProgramClauseImplication {
             consequence: self.cast(interner),
             conditions: Goals::new(interner),
+            priority: ClausePriority::High,
         })
+        .intern(interner)
     }
 }
 
@@ -196,22 +199,24 @@ where
     I: Interner,
 {
     fn cast_to(self, interner: &I) -> ProgramClause<I> {
-        ProgramClause::ForAll(self.map(|bound| ProgramClauseImplication {
+        ProgramClauseData::ForAll(self.map(|bound| ProgramClauseImplication {
             consequence: bound.cast(interner),
             conditions: Goals::new(interner),
+            priority: ClausePriority::High,
         }))
+        .intern(interner)
     }
 }
 
 impl<I: Interner> CastTo<ProgramClause<I>> for ProgramClauseImplication<I> {
-    fn cast_to(self, _interner: &I) -> ProgramClause<I> {
-        ProgramClause::Implies(self)
+    fn cast_to(self, interner: &I) -> ProgramClause<I> {
+        ProgramClauseData::Implies(self).intern(interner)
     }
 }
 
 impl<I: Interner> CastTo<ProgramClause<I>> for Binders<ProgramClauseImplication<I>> {
-    fn cast_to(self, _interner: &I) -> ProgramClause<I> {
-        ProgramClause::ForAll(self)
+    fn cast_to(self, interner: &I) -> ProgramClause<I> {
+        ProgramClauseData::ForAll(self).intern(interner)
     }
 }
 

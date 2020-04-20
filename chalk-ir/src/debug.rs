@@ -35,7 +35,7 @@ impl<I: Interner> Debug for Lifetime<I> {
 
 impl<I: Interner> Debug for Parameter<I> {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
-        I::debug_parameter(self, fmt).unwrap_or_else(|| write!(fmt, "{:?}", self.0))
+        I::debug_parameter(self, fmt).unwrap_or_else(|| write!(fmt, "{:?}", self.interned))
     }
 }
 
@@ -47,7 +47,7 @@ impl<I: Interner> Debug for Goal<I> {
 
 impl<I: Interner> Debug for Goals<I> {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
-        I::debug_goals(self, fmt).unwrap_or_else(|| write!(fmt, "{:?}", self.goals))
+        I::debug_goals(self, fmt).unwrap_or_else(|| write!(fmt, "{:?}", self.interned))
     }
 }
 
@@ -55,6 +55,18 @@ impl<I: Interner> Debug for ProgramClauseImplication<I> {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
         I::debug_program_clause_implication(self, fmt)
             .unwrap_or_else(|| write!(fmt, "ProgramClauseImplication(?)"))
+    }
+}
+
+impl<I: Interner> Debug for ProgramClause<I> {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
+        I::debug_program_clause(self, fmt).unwrap_or_else(|| write!(fmt, "{:?}", self.interned))
+    }
+}
+
+impl<I: Interner> Debug for ProgramClauses<I> {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
+        I::debug_program_clauses(self, fmt).unwrap_or_else(|| write!(fmt, "{:?}", self.interned))
     }
 }
 
@@ -77,9 +89,38 @@ impl<I: Interner> Debug for AliasTy<I> {
     }
 }
 
+impl<I: Interner> Debug for QuantifiedWhereClauses<I> {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
+        I::debug_quantified_where_clauses(self, fmt)
+            .unwrap_or_else(|| write!(fmt, "{:?}", self.interned))
+    }
+}
+
+impl<I: Interner> Debug for ProjectionTy<I> {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
+        I::debug_projection_ty(self, fmt).unwrap_or_else(|| {
+            unimplemented!("cannot format ProjectionTy without setting Program in tls")
+        })
+    }
+}
+
+impl<I: Interner> Debug for OpaqueTy<I> {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
+        I::debug_opaque_ty(self, fmt).unwrap_or_else(|| {
+            unimplemented!("cannot format OpaqueTy without setting Program in tls")
+        })
+    }
+}
+
 impl<I: Interner> Display for Substitution<I> {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
-        I::debug_substitution(self, fmt).unwrap_or_else(|| write!(fmt, "{:?}", self.parameters))
+        I::debug_substitution(self, fmt).unwrap_or_else(|| write!(fmt, "{:?}", self.interned))
+    }
+}
+
+impl<I: Interner> Debug for OpaqueTyId<I> {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
+        I::debug_opaque_ty_id(*self, fmt).unwrap_or_else(|| write!(fmt, "OpaqueTyId({:?})", self.0))
     }
 }
 
@@ -102,6 +143,7 @@ impl<I: Interner> Debug for TypeName<I> {
             TypeName::AssociatedType(assoc_ty) => write!(fmt, "{:?}", assoc_ty),
             TypeName::Scalar(scalar) => write!(fmt, "{:?}", scalar),
             TypeName::Tuple(arity) => write!(fmt, "{:?}", arity),
+            TypeName::OpaqueType(opaque_ty) => write!(fmt, "{:?}", opaque_ty),
             TypeName::Error => write!(fmt, "{{error}}"),
         }
     }
@@ -153,9 +195,9 @@ impl<I: Interner> Debug for Fn<I> {
         // FIXME -- we should introduce some names or something here
         let Fn {
             num_binders,
-            parameters,
+            substitution,
         } = self;
-        write!(fmt, "for<{}> {:?}", num_binders, parameters)
+        write!(fmt, "for<{}> {:?}", num_binders, substitution)
     }
 }
 
@@ -411,6 +453,64 @@ impl<'me, I: Interner> SeparatorTraitRef<'me, I> {
     }
 }
 
+pub struct ProjectionTyDebug<'a, I: Interner> {
+    projection_ty: &'a ProjectionTy<I>,
+    interner: &'a I,
+}
+
+impl<'a, I: Interner> Debug for ProjectionTyDebug<'a, I> {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
+        let ProjectionTyDebug {
+            projection_ty,
+            interner,
+        } = self;
+        write!(
+            fmt,
+            "({:?}){:?}",
+            projection_ty.associated_ty_id,
+            projection_ty.substitution.with_angle(interner)
+        )
+    }
+}
+
+impl<I: Interner> ProjectionTy<I> {
+    pub fn debug<'a>(&'a self, interner: &'a I) -> ProjectionTyDebug<'a, I> {
+        ProjectionTyDebug {
+            projection_ty: self,
+            interner,
+        }
+    }
+}
+
+pub struct OpaqueTyDebug<'a, I: Interner> {
+    opaque_ty: &'a OpaqueTy<I>,
+    interner: &'a I,
+}
+
+impl<'a, I: Interner> Debug for OpaqueTyDebug<'a, I> {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
+        let OpaqueTyDebug {
+            opaque_ty,
+            interner,
+        } = self;
+        write!(
+            fmt,
+            "{:?}{:?}",
+            opaque_ty.opaque_ty_id,
+            opaque_ty.substitution.with_angle(interner)
+        )
+    }
+}
+
+impl<I: Interner> OpaqueTy<I> {
+    pub fn debug<'a>(&'a self, interner: &'a I) -> OpaqueTyDebug<'a, I> {
+        OpaqueTyDebug {
+            opaque_ty: self,
+            interner,
+        }
+    }
+}
+
 pub struct Angle<'a, T>(pub &'a [T]);
 
 impl<'a, T: Debug> Debug for Angle<'a, T> {
@@ -484,6 +584,7 @@ impl<I: Interner> Debug for DomainGoal<I> {
             }
             DomainGoal::Compatible(_) => write!(fmt, "Compatible"),
             DomainGoal::DownstreamType(n) => write!(fmt, "DownstreamType({:?})", n),
+            DomainGoal::Reveal(_) => write!(fmt, "Reveal"),
         }
     }
 }
@@ -522,11 +623,11 @@ impl<T: Debug> Debug for Binders<T> {
     }
 }
 
-impl<I: Interner> Debug for ProgramClause<I> {
+impl<I: Interner> Debug for ProgramClauseData<I> {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
         match self {
-            ProgramClause::Implies(pc) => write!(fmt, "{:?}", pc),
-            ProgramClause::ForAll(pc) => write!(fmt, "{:?}", pc),
+            ProgramClauseData::Implies(pc) => write!(fmt, "{:?}", pc),
+            ProgramClauseData::ForAll(pc) => write!(fmt, "{:?}", pc),
         }
     }
 }

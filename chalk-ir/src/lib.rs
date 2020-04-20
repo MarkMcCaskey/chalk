@@ -1,9 +1,13 @@
 #![deny(rust_2018_idioms)]
 
+// Allows macros to refer to this crate as `::chalk_ir`
+extern crate self as chalk_ir;
+
 use crate::cast::{Cast, CastTo};
 use crate::fold::shift::Shift;
 use crate::fold::{Fold, Folder, Subst, SuperFold};
-use chalk_derive::{Fold, HasInterner};
+use crate::visit::{SuperVisit, Visit, VisitExt, VisitResult, Visitor};
+use chalk_derive::{Fold, HasInterner, SuperVisit, Visit};
 use chalk_engine::fallible::*;
 use std::iter;
 use std::marker::PhantomData;
@@ -34,39 +38,45 @@ pub mod zip;
 #[macro_use]
 pub mod fold;
 
+#[macro_use]
+pub mod visit;
+
 pub mod cast;
 
 pub mod interner;
-use interner::{HasInterner, Interner, TargetInterner};
+use interner::{HasInterner, Interner};
 
 pub mod could_match;
 pub mod debug;
 #[cfg(any(test, feature = "default-interner"))]
 pub mod tls;
 
-#[derive(Clone, PartialEq, Eq, Hash, Fold, HasInterner)]
+#[derive(Clone, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
 /// The set of assumptions we've made so far, and the current number of
 /// universal (forall) quantifiers we're within.
 pub struct Environment<I: Interner> {
-    pub clauses: Vec<ProgramClause<I>>,
+    pub clauses: ProgramClauses<I>,
 }
 
 impl<I: Interner> Environment<I> {
-    pub fn new() -> Self {
-        Environment { clauses: vec![] }
+    pub fn new(interner: &I) -> Self {
+        Environment {
+            clauses: ProgramClauses::new(interner),
+        }
     }
 
-    pub fn add_clauses<II>(&self, clauses: II) -> Self
+    pub fn add_clauses<II>(&self, interner: &I, clauses: II) -> Self
     where
         II: IntoIterator<Item = ProgramClause<I>>,
     {
         let mut env = self.clone();
-        env.clauses = env.clauses.into_iter().chain(clauses).collect();
+        env.clauses =
+            ProgramClauses::from(interner, env.clauses.iter(interner).cloned().chain(clauses));
         env
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Fold)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Fold, Visit)]
 pub struct InEnvironment<G: HasInterner> {
     pub environment: Environment<G::Interner>,
     pub goal: G,
@@ -131,7 +141,7 @@ pub enum Scalar {
     Float(FloatTy),
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Fold)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Fold, Visit)]
 pub enum TypeName<I: Interner> {
     /// a type like `Vec<T>`
     Struct(StructId<I>),
@@ -144,6 +154,8 @@ pub enum TypeName<I: Interner> {
 
     /// a tuple of the given arity
     Tuple(usize),
+    /// a placeholder for opaque types like `impl Trait`
+    OpaqueType(OpaqueTyId<I>),
 
     /// This can be used to represent an error, e.g. during name resolution of a type.
     /// Chalk itself will not produce this, just pass it through when given.
@@ -207,6 +219,9 @@ pub struct ClauseId<I: Interner>(pub I::DefId);
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AssocTypeId<I: Interner>(pub I::DefId);
 
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OpaqueTyId<I: Interner>(pub I::DefId);
+
 impl_debugs!(ImplId, ClauseId);
 
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, HasInterner)]
@@ -260,6 +275,14 @@ impl<I: Interner> Ty<I> {
         }
     }
 
+    /// Returns true if this is a `BoundVar` or `InferenceVar`.
+    pub fn is_var(&self, interner: &I) -> bool {
+        match self.data(interner) {
+            TyData::BoundVar(_) | TyData::InferenceVar(_) => true,
+            _ => false,
+        }
+    }
+
     pub fn is_alias(&self, interner: &I) -> bool {
         match self.data(interner) {
             TyData::Alias(..) => true,
@@ -271,8 +294,7 @@ impl<I: Interner> Ty<I> {
     /// needs to be shifted across binders. This is a very inefficient
     /// check, intended only for debug assertions, because I am lazy.
     pub fn needs_shift(&self, interner: &I) -> bool {
-        let ty = self.clone();
-        ty != ty.shifted_in(interner)
+        self.has_free_vars(interner)
     }
 }
 
@@ -579,9 +601,9 @@ impl DebruijnIndex {
 /// known. It is referenced within the type using `^1`, indicating
 /// a bound type with debruijn index 1 (i.e., skipping through one
 /// level of binder).
-#[derive(Clone, PartialEq, Eq, Hash, Fold)]
+#[derive(Clone, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
 pub struct DynTy<I: Interner> {
-    pub bounds: Binders<Vec<QuantifiedWhereClause<I>>>,
+    pub bounds: Binders<QuantifiedWhereClauses<I>>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -614,7 +636,7 @@ impl InferenceVar {
 #[derive(Clone, PartialEq, Eq, Hash, HasInterner)]
 pub struct Fn<I: Interner> {
     pub num_binders: usize,
-    pub parameters: Vec<Parameter<I>>,
+    pub substitution: Substitution<I>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, HasInterner)]
@@ -696,7 +718,7 @@ impl PlaceholderIndex {
 }
 
 // Fold derive intentionally omitted, folded through Ty
-#[derive(Clone, PartialEq, Eq, Hash, Fold, HasInterner)]
+#[derive(Clone, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
 pub struct ApplicationTy<I: Interner> {
     pub name: TypeName<I>,
     pub substitution: Substitution<I>,
@@ -797,20 +819,22 @@ impl<T, L> ParameterKind<T, L> {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, HasInterner)]
-pub struct Parameter<I: Interner>(I::InternedParameter);
+pub struct Parameter<I: Interner> {
+    interned: I::InternedParameter,
+}
 
 impl<I: Interner> Parameter<I> {
     pub fn new(interner: &I, data: ParameterData<I>) -> Self {
         let interned = I::intern_parameter(interner, data);
-        Parameter(interned)
+        Parameter { interned }
     }
 
     pub fn interned(&self) -> &I::InternedParameter {
-        &self.0
+        &self.interned
     }
 
     pub fn data(&self, interner: &I) -> &ParameterData<I> {
-        I::parameter_data(interner, &self.0)
+        I::parameter_data(interner, &self.interned)
     }
 
     pub fn assert_ty_ref(&self, interner: &I) -> &Ty<I> {
@@ -859,19 +883,43 @@ impl<I: Interner> ParameterData<I> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Fold, HasInterner)]
-pub struct AliasTy<I: Interner> {
-    pub associated_ty_id: AssocTypeId<I>,
-    pub substitution: Substitution<I>,
+#[derive(Clone, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
+pub enum AliasTy<I: Interner> {
+    Projection(ProjectionTy<I>),
+    Opaque(OpaqueTy<I>),
 }
 
 impl<I: Interner> AliasTy<I> {
     pub fn intern(self, interner: &I) -> Ty<I> {
         Ty::new(interner, self)
     }
+
+    pub fn self_type_parameter(&self, interner: &I) -> Ty<I> {
+        match self {
+            AliasTy::Projection(projection_ty) => projection_ty
+                .substitution
+                .iter(interner)
+                .find_map(move |p| p.ty(interner))
+                .unwrap()
+                .clone(),
+            _ => todo!(),
+        }
+    }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Fold, HasInterner)]
+#[derive(Clone, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
+pub struct ProjectionTy<I: Interner> {
+    pub associated_ty_id: AssocTypeId<I>,
+    pub substitution: Substitution<I>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
+pub struct OpaqueTy<I: Interner> {
+    pub opaque_ty_id: OpaqueTyId<I>,
+    pub substitution: Substitution<I>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
 pub struct TraitRef<I: Interner> {
     pub trait_id: TraitId<I>,
     pub substitution: Substitution<I>,
@@ -899,13 +947,13 @@ impl<I: Interner> TraitRef<I> {
 }
 
 /// Where clauses that can be written by a Rust programmer.
-#[derive(Clone, PartialEq, Eq, Hash, Fold, HasInterner)]
+#[derive(Clone, PartialEq, Eq, Hash, Fold, SuperVisit, HasInterner)]
 pub enum WhereClause<I: Interner> {
     Implemented(TraitRef<I>),
     AliasEq(AliasEq<I>),
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Fold, HasInterner)]
+#[derive(Clone, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
 pub enum WellFormed<I: Interner> {
     /// A predicate which is true is some trait ref is well-formed.
     /// For example, given the following trait definitions:
@@ -935,7 +983,7 @@ pub enum WellFormed<I: Interner> {
     Ty(Ty<I>),
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Fold, HasInterner)]
+#[derive(Clone, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
 pub enum FromEnv<I: Interner> {
     /// A predicate which enables deriving everything which should be true if we *know* that
     /// some trait ref is well-formed. For example given the above trait definitions, we can use
@@ -967,7 +1015,7 @@ pub enum FromEnv<I: Interner> {
 /// A "domain goal" is a goal that is directly about Rust, rather than a pure
 /// logical statement. As much as possible, the Chalk solver should avoid
 /// decomposing this enum, and instead treat its values opaquely.
-#[derive(Clone, PartialEq, Eq, Hash, Fold, HasInterner)]
+#[derive(Clone, PartialEq, Eq, Hash, Fold, SuperVisit, HasInterner)]
 pub enum DomainGoal<I: Interner> {
     Holds(WhereClause<I>),
 
@@ -1028,6 +1076,10 @@ pub enum DomainGoal<I: Interner> {
     ///
     /// This makes a new type `T` available and makes `DownstreamType(T)` provable for that type.
     DownstreamType(Ty<I>),
+
+    /// Used to activate the "reveal mode", in which opaque (`impl Trait`) types can be equated
+    /// to their actual type.
+    Reveal(()),
 }
 
 pub type QuantifiedWhereClause<I> = Binders<WhereClause<I>>;
@@ -1035,7 +1087,7 @@ pub type QuantifiedWhereClause<I> = Binders<WhereClause<I>>;
 impl<I: Interner> WhereClause<I> {
     /// Turn a where clause into the WF version of it i.e.:
     /// * `Implemented(T: Trait)` maps to `WellFormed(T: Trait)`
-    /// * `AliasEq(<T as Trait>::Item = Foo)` maps to `WellFormed(<T as Trait>::Item = Foo)`
+    /// * `ProjectionEq(<T as Trait>::Item = Foo)` maps to `WellFormed(<T as Trait>::Item = Foo)`
     /// * any other clause maps to itself
     pub fn into_well_formed_goal(self, interner: &I) -> DomainGoal<I> {
         match self {
@@ -1071,6 +1123,62 @@ impl<I: Interner> QuantifiedWhereClause<I> {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, HasInterner)]
+pub struct QuantifiedWhereClauses<I: Interner> {
+    interned: I::InternedQuantifiedWhereClauses,
+}
+
+impl<I: Interner> QuantifiedWhereClauses<I> {
+    pub fn new(interner: &I) -> Self {
+        Self::from(interner, None::<QuantifiedWhereClause<I>>)
+    }
+
+    pub fn interned(&self) -> &I::InternedQuantifiedWhereClauses {
+        &self.interned
+    }
+
+    pub fn from(
+        interner: &I,
+        clauses: impl IntoIterator<Item = impl CastTo<QuantifiedWhereClause<I>>>,
+    ) -> Self {
+        use crate::cast::Caster;
+        QuantifiedWhereClauses {
+            interned: I::intern_quantified_where_clauses(
+                interner,
+                clauses.into_iter().casted(interner),
+            ),
+        }
+    }
+
+    pub fn from_fallible<E>(
+        interner: &I,
+        clauses: impl IntoIterator<Item = Result<impl CastTo<QuantifiedWhereClause<I>>, E>>,
+    ) -> Result<Self, E> {
+        use crate::cast::Caster;
+        let clauses = clauses
+            .into_iter()
+            .casted(interner)
+            .collect::<Result<Vec<QuantifiedWhereClause<I>>, _>>()?;
+        Ok(Self::from(interner, clauses))
+    }
+
+    pub fn iter(&self, interner: &I) -> std::slice::Iter<'_, QuantifiedWhereClause<I>> {
+        self.as_slice(interner).iter()
+    }
+
+    pub fn is_empty(&self, interner: &I) -> bool {
+        self.as_slice(interner).is_empty()
+    }
+
+    pub fn len(&self, interner: &I) -> usize {
+        self.as_slice(interner).len()
+    }
+
+    pub fn as_slice(&self, interner: &I) -> &[QuantifiedWhereClause<I>] {
+        interner.quantified_where_clauses_data(&self.interned)
+    }
+}
+
 impl<I: Interner> DomainGoal<I> {
     /// Convert `Implemented(...)` into `FromEnv(...)`, but leave other
     /// goals unchanged.
@@ -1080,9 +1188,18 @@ impl<I: Interner> DomainGoal<I> {
             goal => goal,
         }
     }
+
+    pub fn inputs(&self, interner: &I) -> Vec<Parameter<I>> {
+        match self {
+            DomainGoal::Holds(WhereClause::AliasEq(alias_eq)) => {
+                vec![ParameterKind::Ty(alias_eq.alias.clone().intern(interner)).intern(interner)]
+            }
+            _ => Vec::new(),
+        }
+    }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Fold)]
+#[derive(Clone, PartialEq, Eq, Hash, Fold, Visit)]
 pub struct EqGoal<I: Interner> {
     pub a: Parameter<I>,
     pub b: Parameter<I>,
@@ -1092,16 +1209,14 @@ pub struct EqGoal<I: Interner> {
 /// type. A projection `T::Foo` normalizes to the type `U` if we can
 /// **match it to an impl** and that impl has a `type Foo = V` where
 /// `U = V`.
-#[derive(Clone, PartialEq, Eq, Hash, Fold)]
+#[derive(Clone, PartialEq, Eq, Hash, Fold, Visit)]
 pub struct Normalize<I: Interner> {
     pub alias: AliasTy<I>,
     pub ty: Ty<I>,
 }
 
-/// Proves **equality** between a projection `T::Foo` and a type
-/// `U`. Equality can be proven via normalization, but we can also
-/// prove that `T::Foo = V::Foo` if `T = V` without normalizing.
-#[derive(Clone, PartialEq, Eq, Hash, Fold)]
+/// Proves **equality** between an alias and a type.
+#[derive(Clone, PartialEq, Eq, Hash, Fold, Visit)]
 pub struct AliasEq<I: Interner> {
     pub alias: AliasTy<I>,
     pub ty: Ty<I>,
@@ -1121,7 +1236,7 @@ impl<I: Interner> HasInterner for AliasEq<I> {
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Binders<T> {
     pub binders: Vec<ParameterKind<()>>,
-    pub value: T,
+    value: T,
 }
 
 impl<T: HasInterner> HasInterner for Binders<T> {
@@ -1129,6 +1244,35 @@ impl<T: HasInterner> HasInterner for Binders<T> {
 }
 
 impl<T> Binders<T> {
+    pub fn new(binders: Vec<ParameterKind<()>>, value: T) -> Self {
+        Self { binders, value }
+    }
+
+    /// Skips the binder and returns the "bound" value. This is a
+    /// risky thing to do because it's easy to get confused about
+    /// De Bruijn indices and the like. `skip_binder` is only valid
+    /// when you are either extracting data that has nothing to
+    /// do with bound vars, or you are being very careful about
+    /// your depth accounting.
+    ///
+    /// Some examples where `skip_binder` is reasonable:
+    ///
+    /// - extracting the `TraitId` from a TraitRef;
+    /// - checking if there are any fields in a StructDatum
+    pub fn skip_binders(&self) -> &T {
+        &self.value
+    }
+
+    /// Converts `&Binders<T>` to `Binders<&T>`. Produces new `Binders`
+    /// with cloned quantifiers containing a reference to the original
+    /// value, leaving the original in place.
+    pub fn as_ref(&self) -> Binders<&T> {
+        Binders {
+            binders: self.binders.clone(),
+            value: &self.value,
+        }
+    }
+
     pub fn map<U, OP>(self, op: OP) -> Binders<U>
     where
         OP: FnOnce(T) -> U,
@@ -1144,11 +1288,7 @@ impl<T> Binders<T> {
     where
         OP: FnOnce(&'a T) -> U,
     {
-        let value = op(&self.value);
-        Binders {
-            binders: self.binders.clone(),
-            value,
-        }
+        self.as_ref().map(op)
     }
 
     /// Creates a fresh binders that contains a single type
@@ -1173,6 +1313,12 @@ impl<T> Binders<T> {
 
     pub fn len(&self) -> usize {
         self.binders.len()
+    }
+}
+
+impl<T> From<Binders<T>> for (Vec<ParameterKind<()>>, T) {
+    fn from(binders: Binders<T>) -> Self {
+        (binders.binders, binders.value)
     }
 }
 
@@ -1243,14 +1389,31 @@ impl<V: IntoIterator> Iterator for BindersIntoIterator<V> {
 /// Represents one clause of the form `consequence :- conditions` where
 /// `conditions = cond_1 && cond_2 && ...` is the conjunction of the individual
 /// conditions.
-#[derive(Clone, PartialEq, Eq, Hash, Fold, HasInterner)]
+#[derive(Clone, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
 pub struct ProgramClauseImplication<I: Interner> {
     pub consequence: DomainGoal<I>,
     pub conditions: Goals<I>,
+    pub priority: ClausePriority,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, HasInterner)]
-pub enum ProgramClause<I: Interner> {
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum ClausePriority {
+    High,
+    Low,
+}
+
+impl std::ops::BitAnd for ClausePriority {
+    type Output = ClausePriority;
+    fn bitand(self, rhs: ClausePriority) -> Self::Output {
+        match (self, rhs) {
+            (ClausePriority::High, ClausePriority::High) => ClausePriority::High,
+            _ => ClausePriority::Low,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Fold, HasInterner)]
+pub enum ProgramClauseData<I: Interner> {
     Implies(ProgramClauseImplication<I>),
     ForAll(Binders<ProgramClauseImplication<I>>),
 }
@@ -1261,6 +1424,7 @@ impl<I: Interner> ProgramClauseImplication<I> {
             ProgramClauseImplication {
                 consequence: self.consequence.into_from_env_goal(interner),
                 conditions: self.conditions.clone(),
+                priority: self.priority,
             }
         } else {
             self
@@ -1268,16 +1432,101 @@ impl<I: Interner> ProgramClauseImplication<I> {
     }
 }
 
-impl<I: Interner> ProgramClause<I> {
-    pub fn into_from_env_clause(self, interner: &I) -> ProgramClause<I> {
+impl<I: Interner> ProgramClauseData<I> {
+    pub fn into_from_env_clause(self, interner: &I) -> ProgramClauseData<I> {
         match self {
-            ProgramClause::Implies(implication) => {
-                ProgramClause::Implies(implication.into_from_env_clause(interner))
+            ProgramClauseData::Implies(implication) => {
+                ProgramClauseData::Implies(implication.into_from_env_clause(interner))
             }
-            ProgramClause::ForAll(binders_implication) => {
-                ProgramClause::ForAll(binders_implication.map(|i| i.into_from_env_clause(interner)))
-            }
+            ProgramClauseData::ForAll(binders_implication) => ProgramClauseData::ForAll(
+                binders_implication.map(|i| i.into_from_env_clause(interner)),
+            ),
         }
+    }
+
+    pub fn intern(self, interner: &I) -> ProgramClause<I> {
+        ProgramClause {
+            interned: interner.intern_program_clause(self),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, HasInterner)]
+pub struct ProgramClause<I: Interner> {
+    interned: I::InternedProgramClause,
+}
+
+impl<I: Interner> ProgramClause<I> {
+    pub fn new(interner: &I, clause: ProgramClauseData<I>) -> Self {
+        let interned = interner.intern_program_clause(clause);
+        Self { interned }
+    }
+
+    pub fn into_from_env_clause(self, interner: &I) -> ProgramClause<I> {
+        let program_clause_data = self.data(interner);
+        let new_clause = program_clause_data.clone().into_from_env_clause(interner);
+        Self::new(interner, new_clause)
+    }
+
+    pub fn interned(&self) -> &I::InternedProgramClause {
+        &self.interned
+    }
+
+    pub fn data(&self, interner: &I) -> &ProgramClauseData<I> {
+        interner.program_clause_data(&self.interned)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, HasInterner)]
+pub struct ProgramClauses<I: Interner> {
+    interned: I::InternedProgramClauses,
+}
+
+impl<I: Interner> ProgramClauses<I> {
+    pub fn new(interner: &I) -> Self {
+        Self::from(interner, None::<ProgramClause<I>>)
+    }
+
+    pub fn interned(&self) -> &I::InternedProgramClauses {
+        &self.interned
+    }
+
+    pub fn from(
+        interner: &I,
+        clauses: impl IntoIterator<Item = impl CastTo<ProgramClause<I>>>,
+    ) -> Self {
+        use crate::cast::Caster;
+        ProgramClauses {
+            interned: I::intern_program_clauses(interner, clauses.into_iter().casted(interner)),
+        }
+    }
+
+    pub fn from_fallible<E>(
+        interner: &I,
+        clauses: impl IntoIterator<Item = Result<impl CastTo<ProgramClause<I>>, E>>,
+    ) -> Result<Self, E> {
+        use crate::cast::Caster;
+        let clauses = clauses
+            .into_iter()
+            .casted(interner)
+            .collect::<Result<Vec<ProgramClause<I>>, _>>()?;
+        Ok(Self::from(interner, clauses))
+    }
+
+    pub fn iter(&self, interner: &I) -> std::slice::Iter<'_, ProgramClause<I>> {
+        self.as_slice(interner).iter()
+    }
+
+    pub fn is_empty(&self, interner: &I) -> bool {
+        self.as_slice(interner).is_empty()
+    }
+
+    pub fn len(&self, interner: &I) -> usize {
+        self.as_slice(interner).len()
+    }
+
+    pub fn as_slice(&self, interner: &I) -> &[ProgramClause<I>] {
+        interner.program_clauses_data(&self.interned)
     }
 }
 
@@ -1324,12 +1573,36 @@ impl<T> UCanonical<T> {
         );
         subst.is_identity_subst(interner)
     }
+
+    pub fn trivial_substitution<I: Interner>(&self, interner: &I) -> Substitution<I> {
+        let binders = &self.canonical.binders;
+        Substitution::from(
+            interner,
+            binders
+                .iter()
+                .enumerate()
+                .map(|(index, pk)| {
+                    let bound_var = BoundVar::new(DebruijnIndex::INNERMOST, index);
+                    match pk {
+                        ParameterKind::Ty(_) => {
+                            ParameterKind::Ty(TyData::BoundVar(bound_var).intern(interner))
+                                .intern(interner)
+                        }
+                        ParameterKind::Lifetime(_) => ParameterKind::Lifetime(
+                            LifetimeData::BoundVar(bound_var).intern(interner),
+                        )
+                        .intern(interner),
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, HasInterner)]
 /// A list of goals.
 pub struct Goals<I: Interner> {
-    goals: I::InternedGoals,
+    interned: I::InternedGoals,
 }
 
 impl<I: Interner> Goals<I> {
@@ -1338,13 +1611,13 @@ impl<I: Interner> Goals<I> {
     }
 
     pub fn interned(&self) -> &I::InternedGoals {
-        &self.goals
+        &self.interned
     }
 
     pub fn from(interner: &I, goals: impl IntoIterator<Item = impl CastTo<Goal<I>>>) -> Self {
         use crate::cast::Caster;
         Goals {
-            goals: I::intern_goals(interner, goals.into_iter().casted(interner)),
+            interned: I::intern_goals(interner, goals.into_iter().casted(interner)),
         }
     }
 
@@ -1373,7 +1646,7 @@ impl<I: Interner> Goals<I> {
     }
 
     pub fn as_slice(&self, interner: &I) -> &[Goal<I>] {
-        interner.goals_data(&self.goals)
+        interner.goals_data(&self.interned)
     }
 }
 
@@ -1426,10 +1699,10 @@ impl<I: Interner> Goal<I> {
             QuantifierKind::ForAll,
             Binders::with_fresh_type_var(interner, |ty| {
                 GoalData::Implies(
-                    vec![
-                        DomainGoal::Compatible(()).cast(interner),
-                        DomainGoal::DownstreamType(ty).cast(interner),
-                    ],
+                    ProgramClauses::from(
+                        interner,
+                        vec![DomainGoal::Compatible(()), DomainGoal::DownstreamType(ty)],
+                    ),
                     self.shifted_in(interner),
                 )
                 .intern(interner)
@@ -1438,7 +1711,7 @@ impl<I: Interner> Goal<I> {
         .intern(interner)
     }
 
-    pub fn implied_by(self, interner: &I, predicates: Vec<ProgramClause<I>>) -> Goal<I> {
+    pub fn implied_by(self, interner: &I, predicates: ProgramClauses<I>) -> Goal<I> {
         GoalData::Implies(predicates, self).intern(interner)
     }
 
@@ -1480,13 +1753,13 @@ where
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Fold, HasInterner)]
+#[derive(Clone, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
 /// A general goal; this is the full range of questions you can pose to Chalk.
 pub enum GoalData<I: Interner> {
     /// Introduces a binding at depth 0, shifting other bindings up
     /// (deBruijn index).
     Quantified(QuantifierKind, Binders<Goal<I>>),
-    Implies(Vec<ProgramClause<I>>, Goal<I>),
+    Implies(ProgramClauses<I>, Goal<I>),
     All(Goals<I>),
     Not(Goal<I>),
 
@@ -1527,7 +1800,7 @@ pub enum QuantifierKind {
 /// lifetime constraints, instead gathering them up to return with our solution
 /// for later checking. This allows for decoupling between type and region
 /// checking in the compiler.
-#[derive(Clone, PartialEq, Eq, Hash, Fold, HasInterner)]
+#[derive(Clone, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
 pub enum Constraint<I: Interner> {
     LifetimeEq(Lifetime<I>, Lifetime<I>),
 }
@@ -1538,7 +1811,7 @@ pub struct Substitution<I: Interner> {
     /// Map free variable with given index to the value with the same
     /// index. Naturally, the kind of the variable must agree with
     /// the kind of the value.
-    parameters: I::InternedSubstitution,
+    interned: I::InternedSubstitution,
 }
 
 impl<I: Interner> Substitution<I> {
@@ -1561,12 +1834,12 @@ impl<I: Interner> Substitution<I> {
     ) -> Result<Self, E> {
         use crate::cast::Caster;
         Ok(Substitution {
-            parameters: I::intern_substitution(interner, parameters.into_iter().casted(interner))?,
+            interned: I::intern_substitution(interner, parameters.into_iter().casted(interner))?,
         })
     }
 
     pub fn interned(&self) -> &I::InternedSubstitution {
-        &self.parameters
+        &self.interned
     }
 
     /// Index into the list of parameters
@@ -1591,7 +1864,7 @@ impl<I: Interner> Substitution<I> {
     }
 
     pub fn parameters(&self, interner: &I) -> &[Parameter<I>] {
-        interner.substitution_data(&self.parameters)
+        interner.substitution_data(&self.interned)
     }
 
     pub fn len(&self, interner: &I) -> usize {
@@ -1734,13 +2007,13 @@ impl<'i, I: Interner> Folder<'i, I> for &SubstFolder<'i, I> {
 /// substitution stores the values for the query's unknown variables,
 /// and the constraints represents any region constraints that must
 /// additionally be solved.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Fold, HasInterner)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
 pub struct ConstrainedSubst<I: Interner> {
     pub subst: Substitution<I>, /* NB: The `is_trivial` routine relies on the fact that `subst` is folded first. */
     pub constraints: Vec<InEnvironment<Constraint<I>>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Fold, HasInterner)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Fold, Visit, HasInterner)]
 pub struct AnswerSubst<I: Interner> {
     pub subst: Substitution<I>, /* NB: The `is_trivial` routine relies on the fact that `subst` is folded first. */
     pub constraints: Vec<InEnvironment<Constraint<I>>>,
